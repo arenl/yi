@@ -22,23 +22,6 @@ data-files:
 
 extra-source-files: src/library/Yi/Lexer/common.hsinc
 
--- Frontends
-flag cocoa
-  Default: False
-  Description: "Build with Cocoa frontend"
-
-flag pango
-  Default: False
-  Description: "Build with Pango frontend"
-
-flag vte
-  Default: False
-  Description: "Build with Vte frontend"
-
-flag vty
-  Default: True
-  Description: "Build with Vty frontend"
-
 flag scion
   Default: False
   Description: Use the scion library to provide extra commands that interface with GHC (experimental)
@@ -178,6 +161,7 @@ library
     Data.Rope
     Data.Prototype
     Parser.Incremental
+    Paths_yi
 
   build-depends:
     Cabal >= 1.10 && < 1.11,
@@ -231,52 +215,6 @@ library
       QuickCheck >= 2.1.0.2,
       random
 
-  -- Frontends
-  if flag(cocoa)
-    exposed-modules:
-      Yi.UI.Cocoa
-    other-modules:
-      Yi.UI.Cocoa.Application
-      Yi.UI.Cocoa.TextStorage
-      Yi.UI.Cocoa.TextView
-      Yi.UI.Cocoa.Utils
-    build-depends:
-      HOC,
-      HOC-AppKit,
-      HOC-Foundation
-    cpp-options: -DFRONTEND_COCOA
-
-  if flag(pango)
-    exposed-modules:
-      Yi.UI.Pango
-      Yi.UI.Pango.Control
-    other-modules:
-      Yi.UI.Pango.Utils
-    build-depends:
-      gtk ==0.12.*,
-      glib ==0.12.*,
-      pango ==0.12.*
-    cpp-options: -DFRONTEND_PANGO
-
-  if flag(vte)
-    exposed-modules:
-      Yi.UI.Vte
-    build-depends:
-      gtk ==0.12.*,
-      glib ==0.12.*,
-      pango ==0.12.*,
-      vte ==0.12.*,
-      executable-path
-    cpp-options: -DFRONTEND_VTE
-
-  if flag(vty)
-    exposed-modules:
-      Yi.UI.Vty
-    build-depends:
-      unix-compat >=0.1 && <0.3,
-      vty >=4.0.0 && <5
-    cpp-options: -DFRONTEND_VTY
-
   if flag (scion)
     cpp-options: -DSCION
     exposed-modules: Yi.Scion
@@ -290,8 +228,6 @@ library
       Shim.ExprSearch, Yi.GHC
 
   other-modules:
-    Paths_yi,
-
     -- "Internal" modules that the user better not see.
     Yi.Buffer.Implementation
 

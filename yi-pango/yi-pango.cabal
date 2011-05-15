@@ -1,5 +1,5 @@
 name:           yi-pango
-version:        0.6.2.5
+version:        0.6.3.0
 category:       Development, Editor
 synopsis:       Pango UI for Yi
 description:
@@ -10,8 +10,8 @@ author:         AUTHORS
 maintainer:     yi-devel@googlegroups.com
 homepage:       http://haskell.org/haskellwiki/Yi
 bug-reports:    http://code.google.com/p/yi-editor/issues/list
-Cabal-Version:  >= 1.6
-tested-with:    GHC==7.0.1
+Cabal-Version:  >= 1.10
+tested-with:    GHC==7.0.2
 build-type:     Simple
 
 flag gnome
@@ -23,24 +23,23 @@ library
   exposed-modules:
     Yi.UI.Pango
     Yi.UI.Pango.Control
+  other-modules:
+    Yi.UI.Pango.Utils
   build-depends:
-    base >=4.0 && <5,
+    base >= 4.0 && < 5,
     containers,
-    filepath>=1.1 && <1.3,
-    monads-fd >=0.1.0.1,
-    pointedlist >= 0.3.5 && <0.4,
-    yi ==0.6.2.5,
-
+    filepath >= 1.1 && < 1.3,
+    monads-fd >= 0.1.0.1,
+    pointedlist >= 0.3.5 && < 0.4,
+    yi == 0.6.3.0,
+    
     -- Gtk dependencies
-    gtk ==0.12.*,
-    glib ==0.12.*,
-    pango ==0.12.*
-
-  -- Can we remove this?
-  cpp-options: -DFRONTEND_PANGO
-
+    gtk == 0.12.*,
+    glib == 0.12.*,
+    pango == 0.12.*
+  
   if flag(gnome)
     build-depends:
-      gconf ==0.12.*
+      gconf == 0.12.*
     cpp-options: -DGNOME_ENABLED
     exposed-modules: Yi.UI.Pango.Gnome

@@ -1,5 +1,5 @@
 name:           yi-vte
-version:        0.6.3.0
+version:        0.6.3.1
 category:       Development, Editor
 synopsis:       Vte UI for Yi
 description:
@@ -16,14 +16,15 @@ build-type:     Simple
 
 library
   hs-source-dirs: src
+  default-language: Haskell2010
   exposed-modules:
     Yi.UI.Vte
   build-depends:
     base >= 4.0 && < 5,
     containers,
     executable-path,
-    yi == 0.6.3.0,
-    yi-vty == 0.6.3.0,
+    yi == 0.6.3.1,
+    yi-vty == 0.6.3.1,
 
     -- Gtk dependencies
     gtk == 0.12.*,

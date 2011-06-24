@@ -21,7 +21,6 @@ import Yi.MiniBuffer
 import Yi.Misc (adjBlock, adjIndent)
 import Yi.Rectangle
 import Yi.TextCompletion
-import Yi.Keymap
 import Yi.Keymap.Emacs.KillRing
 import Yi.Mode.Buffers ( listBuffers )
 import Yi.Keymap.Emacs.Utils
@@ -50,7 +49,6 @@ import Data.Maybe
 import Data.Char
 
 import Control.Monad
-import Control.Applicative
 
 data ModeMap = ModeMap { eKeymap :: Keymap
                        , completionCaseSensitive :: Bool
@@ -81,7 +79,7 @@ selfInsertKeymap univArg condition = do
   write (adjBlock n >> replicateM_ n (insertB c))
 
 completionKm :: Bool -> Keymap
-completionKm caseSensitive = do some ((meta (char '/') ?>>! wordComplete' caseSensitive))
+completionKm caseSensitive = do discard $ some ((meta (char '/') ?>>! wordComplete' caseSensitive))
                                 deprioritize
                                 write resetComplete
            -- 'adjustPriority' is there to lift the ambiguity between "continuing" completion
@@ -159,6 +157,19 @@ emacsKeys univArg =
 
          -- All the keybindings of the form "C-M-c" where 'c' is some character
          , ( ctrl $ metaCh 'w') ?>>! appendNextKillE
+         , ( ctrl $ metaCh ' ') ?>>! layoutManagersNextE
+         , ( ctrl $ metaCh ',') ?>>! layoutManagerNextVariantE
+         , ( ctrl $ metaCh '.') ?>>! layoutManagerPreviousVariantE
+         , ( ctrl $ metaCh 'j') ?>>! nextWinE
+         , ( ctrl $ metaCh 'k') ?>>! prevWinE
+         , ( ctrl $ meta $ spec KEnter) ?>>! swapWinWithFirstE
+
+
+-- All the keybindings of the form "S-C-M-c" where 'c' is some key
+         , ( shift $ ctrl $ metaCh 'j') ?>>! moveWinNextE
+         , ( shift $ ctrl $ metaCh 'k') ?>>! moveWinPrevE
+         , ( shift $ ctrl $ meta $ spec KEnter) ?>>! pushWinToFirstE
+         , ( Event (KASCII ' ') [MShift,MCtrl,MMeta]) ?>>! layoutManagersPreviousE
 
          -- All the key-bindings which are preceded by a 'C-x'
          , ctrlCh 'x' ?>>      ctrlX

@@ -1,4 +1,5 @@
-{-# LANGUAGE CPP, ExistentialQuantification, DoRec #-}
+{-# LANGUAGE CPP, ExistentialQuantification, DoRec, TupleSections #-}
+{-# OPTIONS_GHC -funbox-strict-fields #-}
 
 -- Copyright (c) 2007, 2008 Jean-Philippe Bernardy
 
@@ -9,7 +10,6 @@ module Yi.UI.Pango (start) where
 import Prelude (catch)
 
 import Control.Concurrent (yield)
-import Control.Monad (ap)
 import Data.Prototype
 import Data.IORef
 import Data.List (drop, intercalate, zip)
@@ -18,7 +18,7 @@ import Data.Maybe
 import qualified Data.Map as M
 import qualified Data.Rope as Rope
 
-import Graphics.UI.Gtk hiding (Region, Window, Action, Point, Style, Modifier)
+import Graphics.UI.Gtk hiding (Region, Window, Action, Point, Style, Modifier, on)
 import Graphics.UI.Gtk.Gdk.GC hiding (foreground)
 import qualified Graphics.UI.Gtk.Gdk.EventM as EventM
 import qualified Graphics.UI.Gtk as Gtk
@@ -32,10 +32,13 @@ import Yi.Config
 import Yi.Editor
 import Yi.Event
 import Yi.Keymap
+import Yi.Layout(DividerPosition, DividerRef)
 import Yi.Style
+import Yi.Tab
 import Yi.Window
 
 import qualified Yi.UI.Common as Common
+import Yi.UI.Pango.Layouts
 import Yi.UI.Pango.Utils
 import Yi.UI.TabBar
 import Yi.UI.Utils
@@ -44,40 +47,60 @@ import Yi.UI.Utils
 import Yi.UI.Pango.Gnome(watchSystemFont)
 #endif
 
+-- We use IORefs in all of these datatypes for all fields which could
+-- possibly change over time.  This ensures that no 'UI', 'TabInfo',
+-- 'WinInfo' will ever go out of date.
+
 data UI = UI
     { uiWindow    :: Gtk.Window
-    , uiNotebook  :: Notebook
+    , uiNotebook  :: SimpleNotebook
     , uiStatusbar :: Statusbar
-    , tabCache    :: IORef [TabInfo]
+    , tabCache    :: IORef TabCache
     , uiActionCh  :: Action -> IO ()
     , uiConfig    :: UIConfig
     , uiFont      :: IORef FontDescription
     , uiInput     :: IMContext
     }
 
+type TabCache = PL.PointedList TabInfo
+
+-- We don't need to know the order of the windows (the layout manages
+-- that) so we might as well use a map
+type WindowCache = M.Map WindowRef WinInfo
+
 data TabInfo = TabInfo
-    { coreTab     :: PL.PointedList Window
-    , page        :: VBox
-    , windowCache :: [WinInfo]
+    { coreTabKey      :: TabRef
+    , layoutDisplay   :: LayoutDisplay
+    , miniwindowPage  :: MiniwindowDisplay
+    , tabWidget       :: Widget
+    , windowCache     :: IORef WindowCache
+    , fullTitle       :: IORef String
+    , abbrevTitle     :: IORef String
     }
 
 instance Show TabInfo where
-    show t = show (coreTab t)
+    show t = show (coreTabKey t)
 
 data WinInfo = WinInfo
-    { coreWin         :: Window
+    { coreWinKey      :: WindowRef
+    , coreWin         :: IORef Window
     , shownTos        :: IORef Point
-    , renderer        :: IORef (ConnectId DrawingArea)
     , lButtonPressed  :: IORef Bool 
+    , insertingMode   :: IORef Bool
+    , cursorLoc       :: IORef CursorLocation
     , winLayout       :: PangoLayout
     , winMetrics      :: FontMetrics
     , textview        :: DrawingArea
     , modeline        :: Label
-    , widget          :: Box -- ^ Top-level widget for this window.
+    , winWidget       :: Widget -- ^ Top-level widget for this window.
     }
 
+data CursorLocation 
+  = CursorLine !Gtk.Point !Gtk.Point 
+  | CursorRectangle !Int !Int !Int !Int
+
 instance Show WinInfo where
-    show w = show (coreWin w)
+    show w = show (coreWinKey w)
 
 instance Ord EventM.Modifier where
   x <= y = fromEnum x <= fromEnum y
@@ -92,7 +115,7 @@ mkUI ui = Common.dummyUI
     , Common.reloadProject = const reloadProject
     }
 
-updateFont :: UIConfig -> IORef FontDescription -> IORef [TabInfo] -> Statusbar
+updateFont :: UIConfig -> IORef FontDescription -> IORef TabCache -> Statusbar
                   -> FontDescription -> IO ()
 updateFont cfg fontRef tc status font = do
     maybe (return ()) (fontDescriptionSetFamily font) (configFontName cfg)
@@ -101,8 +124,8 @@ updateFont cfg fontRef tc status font = do
     widgetModifyFont status (Just font)
     tcs <- readIORef tc
     forM_ tcs $ \tabinfo -> do
-    let wcs = windowCache tabinfo
-    forM_ wcs $ \wininfo -> do
+      wcs <- readIORef (windowCache tabinfo)
+      forM_ wcs $ \wininfo -> do
         layoutSetFontDescription (winLayout wininfo) (Just font)
         -- This will cause the textview to redraw
         widgetModifyFont (textview wininfo) (Just font)
@@ -116,9 +139,9 @@ start :: UIBoot
 start cfg ch outCh ed = catchGError (startNoMsg cfg ch outCh ed) (\(GError _dom _code msg) -> fail msg)
 
 startNoMsg :: UIBoot
-startNoMsg cfg ch outCh _ed = do
+startNoMsg cfg ch outCh ed = do
   logPutStrLn "startNoMsg"
-  unsafeInitGUIForThreadedRTS
+  discard unsafeInitGUIForThreadedRTS
 
   win   <- windowNew
   ico   <- loadIcon "yi+lambda-fat-32.png"
@@ -138,8 +161,8 @@ startNoMsg cfg ch outCh _ed = do
   win `on` keyPressEvent $ handleKeypress ch im
   
   paned <- hPanedNew
-  tabs <- notebookNew
-  panedAdd2 paned tabs
+  tabs <- simpleNotebookNew
+  panedAdd2 paned (baseWidget tabs)
 
   status  <- statusbarNew
   -- statusbarGetContextId status "global"
@@ -150,7 +173,9 @@ startNoMsg cfg ch outCh _ed = do
          ]
 
   fontRef <- newIORef undefined
-  tc <- newIORef []
+
+  let actionCh = outCh . singleton
+  tc <- newIORef =<< newCache ed actionCh
 
 #ifdef GNOME_ENABLED
   let watchFont = watchSystemFont
@@ -160,17 +185,17 @@ startNoMsg cfg ch outCh _ed = do
   watchFont $ updateFont (configUI cfg) fontRef tc status
 
   -- use our magic threads thingy (http://haskell.org/gtk2hs/archives/2005/07/24/writing-multi-threaded-guis/)
-  timeoutAddFull (yield >> return True) priorityDefaultIdle 50
+  discard $ timeoutAddFull (yield >> return True) priorityDefaultIdle 50
 
   widgetShowAll win
 
-  let ui = UI win tabs status tc (outCh . singleton) (configUI cfg) fontRef im
+  let ui = UI win tabs status tc actionCh (configUI cfg) fontRef im
 
   -- Keep the current tab focus up to date
   let move n pl = maybe pl id (PL.move n pl)
       runAction = uiActionCh ui . makeAction
   -- why does this cause a hang without postGUIAsync?
-  onSwitchPage (uiNotebook ui) $ \n -> postGUIAsync $
+  simpleNotebookOnSwitchPage (uiNotebook ui) $ \n -> postGUIAsync $
     runAction (modA tabsA (move n) :: EditorM ())
 
   return (mkUI ui)
@@ -183,112 +208,118 @@ main = logPutStrLn "GTK main loop running" >> mainGUI
 end :: IO ()
 end = mainQuit
 
-syncTabs :: Editor -> UI -> [(PL.PointedList Window, Bool)] -> [TabInfo] -> IO [TabInfo]
-syncTabs e ui (tfocused@(t,focused):ts) (c:cs)
-    | t == coreTab c =
-        do when focused $ setTabFocus ui c
-           let wCache = windowCache c
-           (:) <$> syncTab e ui c t wCache <*> syncTabs e ui ts cs
-    | t `elem` fmap coreTab cs =
-        do removeTab ui c
-           syncTabs e ui (tfocused:ts) cs
-    | otherwise =
-        do c' <- insertTabBefore e ui t c
-           when focused $ setTabFocus ui c'
-           return (c':) `ap` syncTabs e ui ts (c:cs)
-syncTabs e ui ts [] = mapM (\(t,focused) -> do c' <- insertTab e ui t
-                                               when focused $ setTabFocus ui c'
-                                               return c')
-                           ts
-syncTabs _ ui [] cs = mapM_ (removeTab ui) cs >> return []
+-- | Modify GUI and the 'TabCache' to reflect information in 'Editor'.
+updateCache :: UI -> Editor -> IO ()
+updateCache ui e = do
+       cache <- readRef $ tabCache ui
+       -- convert to a map for convenient lookups
+       let cacheMap = mapFromFoldable . fmap (\t -> (coreTabKey t, t)) $ cache
 
-syncTab :: Editor -> UI -> TabInfo -> PL.PointedList Window -> [WinInfo] -> IO TabInfo
-syncTab e ui tab ws cache = do
-    wCache <- syncWindows e ui tab (toList $ PL.withFocus ws) cache
-    return tab { windowCache = wCache }
+       -- build the new cache
+       cache' <- forM (e ^. tabsA) $ \tab ->
+         case M.lookup (tkey tab) cacheMap of
+           Just t -> updateTabInfo e ui tab t >> return t
+           Nothing -> newTab e ui tab
 
--- | Synchronize the windows displayed by GTK with the status of windows in the Core.
-syncWindows :: Editor -> UI -> TabInfo -> [(Window, Bool)] -- ^ windows paired with their "isFocused" state.
-            -> [WinInfo] -> IO [WinInfo]
-syncWindows e ui tab (wfocused@(w,focused):ws) (c:cs)
-    | w == coreWin c =
-        do when focused $ setWindowFocus e ui tab c
-           (c { coreWin = w}:) <$> syncWindows e ui tab ws cs
-    | w `elem` fmap coreWin cs =
-        removeWindow ui tab c >> syncWindows e ui tab (wfocused:ws) cs
-    | otherwise = do
-        c' <- insertWindowBefore e ui tab w c
-        when focused (setWindowFocus e ui tab c')
-        return (c':) `ap` syncWindows e ui tab ws (c:cs)
-syncWindows e ui tab ws [] = mapM (\(w,focused) -> do c' <- insertWindowAtEnd e ui tab w
-                                                      when focused (setWindowFocus e ui tab c')
-                                                      return c')
-                                  ws
-syncWindows _ ui tab [] cs = mapM_ (removeWindow ui tab) cs >> return []
+       -- store the new cache
+       writeRef (tabCache ui) cache'
 
-setTabFocus :: UI -> TabInfo -> IO ()
-setTabFocus ui t = do
-  p <- notebookPageNum (uiNotebook ui) (page t)
-  case p of
-    Just n  -> update (uiNotebook ui) notebookPage n
-    Nothing -> return ()
+       -- update the GUI
+       simpleNotebookSet (uiNotebook ui) =<< forM cache' (\t -> (tabWidget t,) <$> readIORef (abbrevTitle t))
 
--- Only set an attribute if has actually changed.
--- This makes setting window titles much faster.
-update :: forall o a. (Eq a) => o -> ReadWriteAttr o a a -> a -> IO ()
-update w attr val = do oldVal <- get w attr
-                       when (val /= oldVal) $ set w [attr := val]
+
+-- | Modify GUI and given 'TabInfo' to reflect information in 'Tab'.
+updateTabInfo :: Editor -> UI -> Tab -> TabInfo -> IO ()
+updateTabInfo e ui tab tabInfo = do
+    -- update the window cache
+    wCacheOld <- readIORef (windowCache tabInfo)
+    wCacheNew <- mapFromFoldable <$> (forM (tab ^. tabWindowsA) $ \w ->
+      case M.lookup (wkey w) wCacheOld of
+        Just wInfo -> updateWindow e ui w wInfo >> return (wkey w, wInfo)
+        Nothing -> (wkey w,) <$> newWindow e ui w)
+    writeIORef (windowCache tabInfo) wCacheNew
+
+    -- TODO update renderer, etc?
+
+    let lookupWin w = wCacheNew M.! w
+
+    -- set layout
+    layoutDisplaySet (layoutDisplay tabInfo) . fmap (winWidget . lookupWin) . tabLayout $ tab
+
+    -- set minibox
+    miniwindowDisplaySet (miniwindowPage tabInfo) . fmap (winWidget . lookupWin . wkey) . tabMiniWindows $ tab
+
+    -- set focus
+    setWindowFocus e ui tabInfo . lookupWin . wkey . tabFocus $ tab
+
+updateWindow :: Editor -> UI -> Window -> WinInfo -> IO ()
+updateWindow e _ui win wInfo = do
+    writeIORef (coreWin wInfo) win
+    writeIORef (insertingMode wInfo) (askBuffer win (findBufferWith (bufkey win) e) $ getA insertingA)
 
 setWindowFocus :: Editor -> UI -> TabInfo -> WinInfo -> IO ()
 setWindowFocus e ui t w = do
-  let bufferName = shortIdentString (commonNamePrefix e) $ findBufferWith (bufkey $ coreWin w) e
-      ml = askBuffer (coreWin w) (findBufferWith (bufkey $ coreWin w) e) $ getModeLine (commonNamePrefix e)
+  win <- readIORef (coreWin w)
+  let bufferName = shortIdentString (commonNamePrefix e) $ findBufferWith (bufkey win) e
+      ml = askBuffer win (findBufferWith (bufkey win) e) $ getModeLine (commonNamePrefix e)
       im = uiInput ui
 
   update (textview w) widgetIsFocus True
   update (modeline w) labelText ml
-  update (uiWindow ui) windowTitle $ bufferName ++ " - Yi"
-  update (uiNotebook ui) (notebookChildTabLabel (page t)) (tabAbbrevTitle bufferName)
+  writeIORef (fullTitle t) bufferName
+  writeIORef (abbrevTitle t) (tabAbbrevTitle bufferName)
   drawW <- catch (fmap Just $ widgetGetDrawWindow $ textview w) (const (return Nothing))
   imContextSetClientWindow im drawW
   imContextFocusIn im
 
-removeTab :: UI -> TabInfo -> IO ()
-removeTab ui  t = do
-    p <- notebookPageNum (uiNotebook ui) (page t)
-    case p of
-        Just n  -> notebookRemovePage (uiNotebook ui) n
-        Nothing -> return ()
+getWinInfo :: UI -> WindowRef -> IO WinInfo
+getWinInfo ui ref =
+  let tabLoop []     = error "Yi.UI.Pango.getWinInfo: window not found"
+      tabLoop (t:ts) = do
+        wCache <- readIORef (windowCache t)
+        case M.lookup ref wCache of
+          Just w -> return w
+          Nothing -> tabLoop ts
+  in readIORef (tabCache ui) >>= (tabLoop . toList)
 
-removeWindow :: UI -> TabInfo -> WinInfo -> IO ()
-removeWindow _ tab win = containerRemove (page tab) (widget win)
+-- | Make the cache from the editor and the action channel
+newCache :: Editor -> (Action -> IO ()) -> IO TabCache
+newCache e actionCh = mapM (mkDummyTab actionCh) (e ^. tabsA)
 
-getWinInfo :: WindowRef -> [TabInfo] -> (Int, Int, WinInfo)
-getWinInfo ref tabInfos =
-  head [ (tabIx, winIx, winInfo)
-       | (tabIx, tabInfo) <- zip [0..] tabInfos
-       , (winIx, winInfo) <- zip [0..] (windowCache tabInfo)
-       , ref == (wkey . coreWin) winInfo
-       ]
+-- | Make a new tab, and populate it
+newTab :: Editor -> UI -> Tab -> IO TabInfo
+newTab e ui tab = do
+  t <- mkDummyTab (uiActionCh ui) tab
+  updateTabInfo e ui tab t
+  return t
 
--- | Make a new tab.
-newTab :: Editor -> UI -> VBox -> PL.PointedList Window -> IO TabInfo
-newTab e ui vb ws = do
-    let t' = TabInfo { coreTab = ws
-                     , page    = vb
-                     , windowCache = []
-                     }
-    cache <- syncWindows e ui t' (toList $ PL.withFocus ws) []
-    return t' { windowCache = cache }
+-- | Make a minimal new tab, without any windows. This is just for bootstrapping the UI; 'newTab' should normally be called instead.
+mkDummyTab :: (Action -> IO ()) -> Tab -> IO TabInfo
+mkDummyTab actionCh tab = do
+    ws <- newIORef M.empty
+    ld <- layoutDisplayNew
+    layoutDisplayOnDividerMove ld (handleDividerMove actionCh)
+    mwp <- miniwindowDisplayNew
+    tw <- vBoxNew False 0
+    set tw [containerChild := baseWidget ld,
+            containerChild := baseWidget mwp,
+            boxChildPacking (baseWidget ld) := PackGrow,
+            boxChildPacking (baseWidget mwp) := PackNatural]
+    ftRef <- newIORef ""
+    atRef <- newIORef ""
+    return (TabInfo (tkey tab) ld mwp (toWidget tw) ws ftRef atRef)
+
 
 -- | Make a new window.
-newWindow :: Editor -> UI -> Window -> FBuffer -> IO WinInfo
-newWindow e ui w b = do
+newWindow :: Editor -> UI -> Window -> IO WinInfo
+newWindow e ui w = do
+    let b = findBufferWith (bufkey w) e
     f <- readIORef (uiFont ui)
 
     ml <- labelNew Nothing
     widgetModifyFont ml (Just f)
     set ml [ miscXalign := 0.01 ] -- so the text is left-justified.
+    widgetSetSizeRequest ml 0 (-1) -- allow the modeline to be covered up, horizontally
 
     v <- drawingAreaNew
     widgetModifyFont v (Just f)
@@ -318,120 +349,95 @@ newWindow e ui w b = do
                boxChildPacking ml := PackNatural]
       return (castToBox vb)
 
-    sig       <- newIORef =<< (v `onExpose` render e ui b (wkey w))
+    cursorRef <- newIORef (CursorRectangle 0 0 0 0)
     tosRef    <- newIORef (askBuffer w b (getMarkPointB =<< fromMark <$> askMarks))
     context   <- widgetCreatePangoContext v
     layout    <- layoutEmpty context
     language  <- contextGetLanguage context
     metrics   <- contextGetMetrics context f language
     ifLButton <- newIORef False
-      
+    imode     <- newIORef False
+    winRef    <- newIORef w
+
     layoutSetFontDescription layout (Just f)
     layoutSetText layout "" -- stops layoutGetText crashing (as of gtk2hs 0.10.1)
 
-    let win = WinInfo { coreWin   = w
-                      , winLayout  = layout
+    let ref = wkey w
+        win = WinInfo { coreWinKey = ref
+                      , coreWin   = winRef
+                      , winLayout = layout
                       , winMetrics = metrics
                       , textview  = v
                       , modeline  = ml
-                      , widget    = box
-                      , renderer  = sig
+                      , winWidget = toWidget box
                       , shownTos  = tosRef
                       , lButtonPressed = ifLButton
+                      , insertingMode = imode
+                      , cursorLoc = cursorRef
                       }
+    updateWindow e ui w win
 
+    v `on` buttonPressEvent   $ handleButtonClick   ui ref
+    v `on` buttonReleaseEvent $ handleButtonRelease ui win
+    v `on` scrollEvent        $ handleScroll        ui win
+    v `on` configureEvent     $ handleConfigure     ui  -- todo: allocate event rather than configure?
+    v `on` motionNotifyEvent  $ handleMove          ui win
+    discard $ v `onExpose` render ui win
     return win
-
-insertTabBefore :: Editor -> UI -> PL.PointedList Window -> TabInfo -> IO TabInfo
-insertTabBefore e ui ws c = do
-    Just p <- notebookPageNum (uiNotebook ui) (page c)
-    vb <- vBoxNew False 1
-    notebookInsertPage (uiNotebook ui) vb "" p
-    widgetShowAll vb
-    t <- newTab e ui vb ws
-    return t
-
-insertTab :: Editor -> UI -> PL.PointedList Window -> IO TabInfo
-insertTab e ui ws = do
-    vb <- vBoxNew False 1
-    notebookAppendPage (uiNotebook ui) vb ""
-    widgetShowAll $ vb
-    t <- newTab e ui vb ws
-    return t
-
-insertWindowBefore :: Editor -> UI -> TabInfo -> Window -> WinInfo -> IO WinInfo
-insertWindowBefore e ui tab w _c = insertWindow e ui tab w
-
-insertWindowAtEnd :: Editor -> UI -> TabInfo -> Window -> IO WinInfo
-insertWindowAtEnd e ui tab w = insertWindow e ui tab w
-
-insertWindow :: Editor -> UI -> TabInfo -> Window -> IO WinInfo
-insertWindow e ui tab win = do
-  let buf = findBufferWith (bufkey win) e
-  io $ do w <- newWindow e ui win buf
-          set (page tab) $
-            [ containerChild := widget w
-            , boxChildPacking (widget w) :=
-              if isMini (coreWin w)
-              then PackNatural
-              else PackGrow
-                   
-            , widgetEvents := [ ButtonPressMask
-                              , ButtonReleaseMask
-                              , Button1MotionMask
-                              , ScrollMask
-                              ]
-            ]
-  
-          let ref = (wkey . coreWin) w
-                
-          textview w `on` buttonPressEvent   $ handleButtonClick   ui ref
-          textview w `on` buttonReleaseEvent $ handleButtonRelease ui w
-          textview w `on` scrollEvent        $ handleScroll        ui w
-          textview w `on` configureEvent     $ handleConfigure     ui
-          textview w `on` motionNotifyEvent  $ handleMove          ui w
-          
-          widgetShowAll (widget w)
-          return w
-
-updateCache :: UI -> Editor -> IO ()
-updateCache ui e = do
-    let tabs = e ^. tabsA
-    cache <- readRef $ tabCache ui
-    cache' <- syncTabs e ui (toList $ PL.withFocus tabs) cache
-    writeRef (tabCache ui) cache'
 
 refresh :: UI -> Editor -> IO ()
 refresh ui e = do
-    contextId <- statusbarGetContextId (uiStatusbar ui) "global"
-    statusbarPop  (uiStatusbar ui) contextId
-    statusbarPush (uiStatusbar ui) contextId $ intercalate "  " $ statusLine e
+    postGUIAsync $ do
+       contextId <- statusbarGetContextId (uiStatusbar ui) "global"
+       statusbarPop  (uiStatusbar ui) contextId
+       discard $ statusbarPush (uiStatusbar ui) contextId $ intercalate "  " $ statusLine e
 
     updateCache ui e -- The cursor may have changed since doLayout
     cache <- readRef $ tabCache ui
     forM_ cache $ \t -> do
-        forM_ (windowCache t) $ \w -> do
-            let b = findBufferWith (bufkey (coreWin w)) e
-            -- when (not $ null $ b ^. pendingUpdatesA) $
-            do
-                sig <- readIORef (renderer w)
-                signalDisconnect sig
-                writeRef (renderer w) =<< (textview w `onExpose` render e ui b (wkey (coreWin w)))
-                widgetQueueDraw (textview w)
+        wCache <- readIORef (windowCache t)
+        forM_ wCache $ \w -> do
+            updateWinInfoForRendering e ui w
+            widgetQueueDraw (textview w)
 
-render :: Editor -> UI -> FBuffer -> WindowRef -> t -> IO Bool
-render e ui b ref _ev = do
-  (_,_,w) <- getWinInfo ref <$> readIORef (tabCache ui)
-  let win = coreWin w
-  let tos = max 0 (regionStart (winRegion win))
-  let bos = regionEnd (winRegion win)
-  let (cur, _) = runBuffer win b pointB
+{- | Updates the 'WinInfo' with the information needed for rendering. 
+This involves:
 
+  * setting the text display attributes in the 'PangoLayout'
+
+  * calculating the cursor position.
+
+It is not necessary to set the text content, as this has already
+been done in the previous 'layout' run. 
+(See the note on 'layout' and 'refresh' in "Yi.UI.Common").
+
+We calculate this information synchronously in the 'refresh' loop,
+as the information is guaranteed to be current at this time. If
+this were instead calculating during rendering, then:
+
+  * we would need to recalculate the cursor position on every render
+
+  * the renderer is run by the Gtk event loop, so the sequencing 
+    guarantees of the note in "Yi.UI.Common" may not hold. In particular,
+    in a multithreaded environment it is possible that the text underlying 
+    the 'PangoLayout' has changed before the renderer has had a chance to
+    run, in which case the cursor position calculation will be wrong,
+    and indeed may lead to Pango assertion failures.
+-}
+updateWinInfoForRendering :: Editor -> UI -> WinInfo -> IO ()
+updateWinInfoForRendering e ui w = do
+  -- read the information
+  win <- readIORef (coreWin w)
+  let b = findBufferWith (bufkey win) e
+      tos = max 0 (regionStart (winRegion win))
+      bos = regionEnd (winRegion win)
+      (cur, _) = runBuffer win b pointB
+
+  -- remember the tos (for handling mouse clicks)
   writeRef (shownTos w) tos
-  drawWindow    <- widgetGetDrawWindow $ textview w
 
   -- add color attributes.
-  let picture = askBuffer (coreWin w) b $ attributesPictureAndSelB sty (currentRegex e) (mkRegion tos bos)
+  let picture = askBuffer win b $ attributesPictureAndSelB sty (currentRegex e) (mkRegion tos bos)
       sty = extractValue $ configTheme (uiConfig ui)
       strokes = [(start',s,end') | ((start', s), end') <- zip picture (drop 1 (fmap fst picture) ++ [bos]),
                   s /= emptyAttributes]
@@ -448,23 +454,35 @@ render e ui b ref _ev = do
 
   layoutSetAttributes layout allAttrs
 
-  (PangoRectangle _curX _curY _curW _curH, _) <- layoutGetCursorPos layout (rel cur)
-  PangoRectangle chx chy chw chh              <- layoutIndexToPos layout (rel cur)
-  let curX = round _curX
-      curY = round _curY
-      curW = round _curW
-      curH = round _curH
+  -- calculate the cursor position
+  im <- readIORef (insertingMode w)
+  (PangoRectangle curX curY curW curH, _) <- layoutGetCursorPos layout (rel cur)
+  -- tell the input method
+  imContextSetCursorLocation (uiInput ui) (Rectangle (round curX) (round curY) (round curW) (round curH))
+  -- tell the renderer
+  writeIORef (cursorLoc w) =<<
+    if im 
+      then -- if we are inserting, we just want a line
+         return (CursorLine (round curX, round curY) (round $ curX + curW, round $ curY + curH))
+      else do -- if we aren't inserting, we want a rectangle around the current character
+         PangoRectangle chx chy chw chh <- layoutIndexToPos layout (rel cur)
+         return (CursorRectangle (round chx) (round chy) (if chw > 0 then round chw else 8) (round chh))
     
-  imContextSetCursorLocation (uiInput ui) $ Rectangle curX curY curW curH
-  
+-- | draw the 'PangoLayout' and the cursor onto the screen
+render :: UI -> WinInfo -> t -> IO Bool
+render ui w _event = do
+  drawWindow <- widgetGetDrawWindow $ textview w
   gc <- gcNew drawWindow
-  drawLayout drawWindow gc 0 0 layout
+
+  -- draw the layout
+  drawLayout drawWindow gc 0 0 (winLayout w)
 
   -- paint the cursor   
   gcSetValues gc (newGCValues { Gtk.foreground = mkCol True $ Yi.Style.foreground $ baseAttributes $ configStyle $ uiConfig ui })
-  if askBuffer (coreWin w) b $ getA insertingA
-     then do drawLine drawWindow gc (curX, curY) (curX + curW, curY + curH) 
-     else do drawRectangle drawWindow gc False (round chx) (round chy) (if chw > 0 then round chw else 8) (round chh)
+  cursor <- readIORef (cursorLoc w)
+  case cursor of
+    CursorLine p1 p2 -> drawLine drawWindow gc p1 p2
+    CursorRectangle rx ry rw rh -> drawRectangle drawWindow gc False rx ry rw rh
 
   return True
 
@@ -473,25 +491,27 @@ doLayout ui e = do
     updateCache ui e
     tabs <- readRef $ tabCache ui
     f <- readRef (uiFont ui)
-    heights <- concat <$> mapM (getHeightsInTab ui f e) tabs
-    let e' = (tabsA ^: fmap (fmap updateWin)) e
-        updateWin w = case find (\(ref,_,_) -> (wkey w == ref)) heights of
+    heights <- fold <$> mapM (getHeightsInTab ui f e) tabs
+    let e' = (tabsA ^: fmap (mapWindows updateWin)) e
+        updateWin w = case M.lookup (wkey w) heights of
                           Nothing -> w
-                          Just (_,h,rgn) -> w { height = h, winRegion = rgn }
+                          Just (h,rgn) -> w { height = h, winRegion = rgn }
 
     -- Don't leak references to old Windows
     let forceWin x w = height w `seq` winRegion w `seq` x
-    return $ (foldl . foldl) forceWin e' (e' ^. tabsA)
+    return $ (foldl . tabFoldl) forceWin e' (e' ^. tabsA)
 
-getHeightsInTab :: UI -> FontDescription -> Editor -> TabInfo -> IO [(WindowRef,Int,Region)]
+getHeightsInTab :: UI -> FontDescription -> Editor -> TabInfo -> IO (M.Map WindowRef (Int,Region))
 getHeightsInTab ui f e tab = do
-  forM (windowCache tab) $ \wi -> do
+  wCache <- readIORef (windowCache tab)
+  forM wCache $ \wi -> do
     (_, h) <- widgetGetSize $ textview wi
+    win <- readIORef (coreWin wi)
     let metrics = winMetrics wi
         lineHeight = ascent metrics + descent metrics
-    let b0 = findBufferWith (bufkey (coreWin wi)) e
+    let b0 = findBufferWith (bufkey win) e
     rgn <- shownRegion ui f wi b0
-    let ret= (wkey (coreWin wi), round $ fromIntegral h / lineHeight, rgn)
+    let ret= (round $ fromIntegral h / lineHeight, rgn)
     return ret
 
 shownRegion :: UI -> FontDescription -> WinInfo -> FBuffer -> IO Region
@@ -509,8 +529,8 @@ updatePango ui font w b layout = do
   newFontStr <- Just <$> fontDescriptionToString font
   when (oldFontStr /= newFontStr) (layoutSetFontDescription layout (Just font))
 
-  let win                 = coreWin w
-      [width'', height''] = fmap fromIntegral [width', height']
+  win <- readIORef (coreWin w)
+  let [width'', height''] = fmap fromIntegral [width', height']
       metrics             = winMetrics w
       lineHeight          = ascent metrics + descent metrics
       winh                = max 1 $ floor (height'' / lineHeight)
@@ -603,26 +623,30 @@ modTable = M.fromList
     , (MHyper, EventM.Hyper  )
     ]
 
+-- | Same as Gtk.on, but discards the ConnectId
+on :: object -> Signal object callback -> callback -> IO ()
+on widget signal handler = discard $ Gtk.on widget signal handler
+
 handleButtonClick :: UI -> WindowRef -> EventM EButton Bool
 handleButtonClick ui ref = do
   (x, y) <- eventCoordinates
   click  <- eventClick
   button <- eventButton
   io $ do
-    (_, winIdx, w) <- getWinInfo ref <$> readIORef (tabCache ui)
+    w <- getWinInfo ui ref
     point <- pointToOffset (x, y) w
     
-    -- TODO: check that tabIdx is the focus?
-    let focusWindow = modA windowsA (fromJust . PL.move winIdx)
+    let focusWindow = focusWindowE ref
         runAction = uiActionCh ui . makeAction
     
     runAction focusWindow
     case (click, button) of
       (SingleClick, LeftButton) ->  do
         io $ writeIORef (lButtonPressed w) True
+        win <- io $ readIORef (coreWin w)
         runAction $ do
-          b <- gets $ bkey . findBufferWith (bufkey $ coreWin w)
-          withGivenBufferAndWindow0 (coreWin w) b $ do
+          b <- gets $ bkey . findBufferWith (bufkey win)
+          withGivenBufferAndWindow0 win b $ do
             m <- selMark <$> askMarks
             setMarkPointB m point
             moveTo point
@@ -675,12 +699,16 @@ handleMove :: UI -> WinInfo -> EventM EMotion Bool
 handleMove ui w = eventCoordinates >>= (io . selectArea ui w) >>
                   return True
 
+handleDividerMove :: (Action -> IO ()) -> DividerRef -> DividerPosition -> IO ()
+handleDividerMove actionCh ref pos = actionCh (makeAction (setDividerPosE ref pos))
+
 -- | Convert point coordinates to offset in Yi window
 pointToOffset :: (Double, Double) -> WinInfo -> IO Point
 pointToOffset (x,y) w = do
-  (_, charOffsetX, _) <- layoutXYToIndex (winLayout w) x y
+  im <- readIORef (insertingMode w)
+  (_, charOffsetX, extra) <- layoutXYToIndex (winLayout w) x y
   tos <- readIORef $ shownTos w
-  return $ tos + fromIntegral charOffsetX
+  return $ tos + fromIntegral (charOffsetX + if im then extra else 0)
 
 selectArea :: UI -> WinInfo -> (Double, Double) -> IO ()
 selectArea ui w (x,y) = do
@@ -697,10 +725,11 @@ selectArea ui w (x,y) = do
 
 pasteSelectionClipboard :: UI -> WinInfo -> Point -> Clipboard -> IO ()
 pasteSelectionClipboard ui w p cb = do
+  win <- io $ readIORef (coreWin w)
   let cbHandler Nothing    = return ()
       cbHandler (Just txt) = uiActionCh ui $ makeAction $ do
-        b <- gets $ bkey . findBufferWith (bufkey $ coreWin w)
-        withGivenBufferAndWindow0 (coreWin w) b $ do
+        b <- gets $ bkey . findBufferWith (bufkey win)
+        withGivenBufferAndWindow0 win b $ do
           pointB >>= setSelectionMarkPointB
           moveTo p
           insertN txt

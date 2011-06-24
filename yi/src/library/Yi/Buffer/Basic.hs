@@ -6,15 +6,13 @@ import Prelude (reverse)
 import Data.Binary    
 import Yi.Prelude
 import qualified Data.Rope as R
-import Data.Typeable
 import Data.DeriveTH
-import Data.Derive.Binary
 import Data.Ix
 
 -- | Direction of movement inside a buffer
 data Direction = Backward
                | Forward
-                 deriving (Eq,Ord,Typeable,Show)
+                 deriving (Eq,Ord,Typeable,Show,Bounded,Enum)
 
 $(derive makeBinary ''Direction)
 
@@ -67,3 +65,10 @@ instance SemiNum Point Size where
 
 fromString :: String -> Rope
 fromString = R.fromString
+
+-- | Window references
+newtype WindowRef = WindowRef { unWindowRef :: Int }
+  deriving(Eq, Ord, Enum, Show, Typeable, Binary)
+
+instance Initializable WindowRef where initial = WindowRef (-1)
+

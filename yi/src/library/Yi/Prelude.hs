@@ -5,7 +5,9 @@ module Yi.Prelude
 (<>),
 (++), -- consider scrapping this and replacing it by the above
 (=<<),
+($!),
 Double,
+Binary,
 Char,
 Either(..),
 Endom,
@@ -13,6 +15,7 @@ Eq(..),
 Fractional(..),
 Functor(..),
 IO,
+Initializable(..),
 Integer,
 Integral(..),
 Bounded(..),
@@ -27,9 +30,13 @@ RealFrac(..),
 ReaderT(..),
 SemiNum(..),
 String,
+Typeable,
 commonPrefix,
 discard,
+dummyPut,
+dummyGet,
 every,
+findPL,
 fromIntegral,
 fst,
 fst3,
@@ -42,6 +49,7 @@ last,
 lookup,
 mapAdjust',
 mapAlter',
+mapFromFoldable,
 module Control.Applicative,
 module Control.Category,
 module Data.Accessor, 
@@ -65,6 +73,7 @@ seq,
 singleton,
 snd,
 snd3,
+swapFocus,
 tail,
 trd3,
 undefined,
@@ -76,18 +85,20 @@ writeFile -- because Data.Derive uses it.
 import Prelude hiding (any, all)
 import Yi.Debug
 import Yi.Monad
-import qualified Data.Accessor.Basic
 import Text.Show
 import Data.Bool
+import Data.Binary
 import Data.Foldable
 import Data.Function hiding ((.), id)
+import qualified Data.HashMap.Strict as HashMap
+import Data.Hashable(Hashable)
 import Data.Int
 import Data.Rope (Rope)
 import Control.Category
 import Control.Monad.Reader
-import Control.Applicative
+import Control.Applicative hiding((<$))
 import Data.Traversable 
-import Control.Monad
+import Data.Typeable
 import Data.Monoid
 import qualified Data.Set as Set
 import qualified Data.Map as Map
@@ -96,6 +107,7 @@ import qualified Data.Accessor.Basic as Accessor
 import Data.Accessor ((<.), accessor, getVal, setVal, Accessor,(^.),(^:),(^=))
 import qualified Data.Accessor.Monad.FD.State as Accessor.FD
 import Data.Accessor.Monad.FD.State ((%:), (%=))
+import qualified Data.List.PointedList as PL
     
 type Endom a = a -> a
 
@@ -157,6 +169,9 @@ mapAlter' f = Map.alter f' where
     -- the structure.
 
 
+-- | Generalisation of 'Map.fromList' to arbitrary foldables.
+mapFromFoldable :: (Foldable t, Ord k) => t (k, a) -> Map.Map k a
+mapFromFoldable = foldMap (uncurry Map.singleton)
 
 -- | Alternative to groupBy.
 --
@@ -209,10 +224,18 @@ commonPrefix strings
           prefix = head heads
 -- for an alternative implementation see GHC's InteractiveUI module.
 
+---------------------- PointedList stuff
+-- | Finds the first element satisfying the predicate, and returns a zipper pointing at it.
+findPL :: (a -> Bool) -> [a] -> Maybe (PL.PointedList a)
+findPL p xs = go [] xs where
+  go _  [] = Nothing
+  go ls (f:rs) | p f    = Just (PL.PointedList ls f rs)
+               | otherwise = go (f:ls) rs
 
-
-
------------------------
+-- | Given a function which moves the focus from index A to index B, return a function which swaps the elements at indexes A and B and then moves the focus. See Yi.Editor.swapWinWithFirstE for an example.
+swapFocus :: (PL.PointedList a -> PL.PointedList a) -> (PL.PointedList a -> PL.PointedList a)
+swapFocus moveFocus xs = PL.focusA ^= (xs ^. PL.focusA) $ moveFocus $ PL.focusA ^= (moveFocus xs ^. PL.focusA) $ xs
+----------------------
 -- Acessor stuff
 
 putA :: CMSC.MonadState r m => Accessor.T r a -> a -> m ()
@@ -223,4 +246,28 @@ getA = Accessor.FD.get
 
 modA :: CMSC.MonadState r m => Accessor.T r a -> (a -> a) -> m ()
 modA = Accessor.FD.modify
+
+-------------------- Initializable typeclass
+-- | The default value. If a function tries to get a copy of the state, but the state
+--   hasn't yet been created, 'initial' will be called to supply *some* value. The value
+--   of initial will probably be something like Nothing,  \[\], \"\", or 'Data.Sequence.empty' - compare 
+--   the 'mempty' of "Data.Monoid".
+class Initializable a where
+    initial :: a
+
+instance Initializable (Maybe a) where
+    initial = Nothing
+
+-- | Write nothing. Use with 'dummyGet'
+dummyPut :: a -> Put
+dummyPut _ = return ()
+
+-- | Read nothing, and return 'initial'. Use with 'dummyPut'.
+dummyGet :: Initializable a => Get a
+dummyGet = return initial
+
+----------------- Orphan 'Binary' instances
+instance (Eq k, Hashable k, Binary k, Binary v) => Binary (HashMap.HashMap k v) where
+    put x = put (HashMap.toList x)
+    get = HashMap.fromList <$> get
 

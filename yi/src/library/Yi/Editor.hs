@@ -12,6 +12,7 @@ import Control.Monad.RWS hiding (get, put, mapM, forM_)
 import Data.Accessor.Basic (fromSetGet)
 import Data.Accessor.Template
 import Data.Binary
+import Data.DeriveTH
 import Data.Either (rights)
 import Data.List (nub, delete, (\\), (!!), intercalate, take, drop, cycle)
 import Data.Maybe
@@ -24,8 +25,10 @@ import Yi.Dynamic
 import Yi.Event (Event)
 import Yi.Interact as I
 import Yi.KillRing
+import Yi.Layout
 import Yi.Prelude
 import Yi.Style (StyleName, defaultStyle)
+import Yi.Tab
 import Yi.Window
 import qualified Data.Rope as R
 import qualified Data.DelayList as DelayList
@@ -43,11 +46,11 @@ data Editor = Editor {
                                                     -- Invariant: never empty
                                                     -- Invariant: first buffer is the current one.
        ,buffers       :: !(M.Map BufferRef FBuffer)
-       ,refSupply     :: !Int  -- ^ Supply for buffer and window ids.
+       ,refSupply     :: !Int  -- ^ Supply for buffer, window and tab ids.
 
-       ,tabs_          :: !(PL.PointedList (PL.PointedList Window)) -- ^ current tab contains the visible windows pointed list.
+       ,tabs_          :: !(PL.PointedList Tab) -- ^ current tab contains the visible windows pointed list.
 
-       ,dynamic       :: !(DynamicValues)              -- ^ dynamic components
+       ,dynamic       :: !DynamicValues              -- ^ dynamic components
 
        ,statusLines   :: !Statuses
        ,maxStatusHeight :: !Int
@@ -60,18 +63,20 @@ data Editor = Editor {
     deriving Typeable
 
 instance Binary Editor where
-    put (Editor bss bs supply ts _dv _sl msh kr _re _dir _ev _cwa ) = put bss >> put bs >> put supply >> put ts >> put msh >> put kr
+    put (Editor bss bs supply ts dv _sl msh kr _re _dir _ev _cwa ) = put bss >> put bs >> put supply >> put ts >> put dv >> put msh >> put kr
     get = do
         bss <- get
         bs <- get
         supply <- get
         ts <- get
+        dv <- get
         msh <- get
         kr <- get
         return $ emptyEditor {bufferStack = bss,
                               buffers = bs,
                               refSupply = supply,
                               tabs_ = ts,
+                              dynamic = dv,
                               maxStatusHeight = msh,
                               killring = kr
                              }
@@ -103,12 +108,12 @@ instance MonadEditor EditorM where
 emptyEditor :: Editor
 emptyEditor = Editor {
         buffers      = M.singleton (bkey buf) buf
-       ,tabs_        = PL.singleton (PL.singleton win)
+       ,tabs_        = PL.singleton tab
        ,bufferStack  = [bkey buf]
-       ,refSupply    = 2
+       ,refSupply    = 3
        ,currentRegex = Nothing
        ,searchDirection = Forward
-       ,dynamic      = M.empty
+       ,dynamic      = initial
        ,statusLines  = DelayList.insert (maxBound, ([""], defaultStyle)) []
        ,killring     = krEmpty
        ,pendingEvents = []
@@ -116,7 +121,8 @@ emptyEditor = Editor {
        ,onCloseActions = M.empty
        }
         where buf = newB 0 (Left "console") (R.fromString "")
-              win = (dummyWindow (bkey buf)) {wkey = 1, isMini = False}
+              win = (dummyWindow (bkey buf)) {wkey = WindowRef 1, isMini = False}
+              tab = makeTab1 2 win
 
 -- ---------------------------------------------------------------------
 
@@ -126,17 +132,19 @@ runEditor cfg f e = let (a, e',()) = runRWS (fromEditorM f) cfg e in (e',a)
 $(nameDeriveAccessors ''Editor (\n -> Just (n ++ "A")))
 
 
--- TODO: replace this by accessor
 windows :: Editor -> PL.PointedList Window
-windows editor = PL.focus $ tabs_ editor
+windows e = e ^. windowsA
 
 windowsA :: Accessor Editor (PL.PointedList Window)
-windowsA =  PL.focusA . tabsA
+windowsA =  tabWindowsA . currentTabA
 
-tabsA :: Accessor Editor (PL.PointedList (PL.PointedList Window))
+tabsA :: Accessor Editor (PL.PointedList Tab)
 tabsA = tabs_A . fixCurrentBufferA_
 
-dynA :: Initializable a => Accessor Editor a
+currentTabA :: Accessor Editor Tab
+currentTabA = PL.focusA . tabsA
+
+dynA :: YiVariable a => Accessor Editor a
 dynA = dynamicValueA . dynamicA
 
 -- ---------------------------------------------------------------------
@@ -176,8 +184,8 @@ insertBuffer b = modify $
 forceFold1 :: (Foldable t) => t a -> t a
 forceFold1 x = foldr seq x x
 
-forceFold2 :: (Foldable t1, Foldable t2) => t1 (t2 a) -> t1 (t2 a)
-forceFold2 x = foldr (seq . forceFold1) x x
+forceFoldTabs :: Foldable t => t Tab -> t Tab
+forceFoldTabs x = foldr (seq . forceTab) x x
 
 -- | Delete a buffer (and release resources associated with it).
 deleteBuffer :: BufferRef -> EditorM ()
@@ -209,7 +217,7 @@ deleteBuffer k = do
               switchToBufferE nextB
           modify $ \e -> e {bufferStack = forceFold1 $ filter (k /=) $ bufferStack e,
                             buffers = M.delete k (buffers e),
-                            tabs_ = forceFold2 $ fmap (fmap pickOther) (tabs_ e)
+                            tabs_ = forceFoldTabs $ fmap (mapWindows pickOther) (tabs_ e)
                             -- all windows open on that buffer must switch to another buffer.
                            }
           modA windowsA (fmap (\w -> w { bufAccessList = forceFold1 . filter (k/=) $ bufAccessList w }))
@@ -376,11 +384,11 @@ getRegE = getsA killringA krGet
 --
 
 -- | Retrieve a value from the extensible state
-getDynamic :: Initializable a => EditorM a
+getDynamic :: YiVariable a => EditorM a
 getDynamic = getA (dynamicValueA . dynamicA)
 
 -- | Insert a value into the extensible state, keyed by its type
-setDynamic :: Initializable a => a -> EditorM ()
+setDynamic :: YiVariable a => a -> EditorM ()
 setDynamic x = putA (dynamicValueA . dynamicA) x
 
 -- | Attach the next buffer in the buffer stack to the current window.
@@ -431,9 +439,6 @@ data TempBufferNameHint = TempBufferNameHint
     , tmp_name_index :: Int
     } deriving Typeable
 
-instance Initializable TempBufferNameHint where
-    initial = TempBufferNameHint "tmp" 0
-
 instance Show TempBufferNameHint where
     show (TempBufferNameHint s i) = s ++ "-" ++ show i
 
@@ -450,7 +455,7 @@ newZeroSizeWindow mini bk ref = Window mini bk [] 0 emptyRegion ref 0
 
 -- | Create a new window onto the given buffer.
 newWindowE :: Bool -> BufferRef -> EditorM Window
-newWindowE mini bk = newZeroSizeWindow mini bk <$> newRef
+newWindowE mini bk = newZeroSizeWindow mini bk . WindowRef <$> newRef
 
 -- | Attach the specified buffer to the current window
 switchToBufferE :: BufferRef -> EditorM ()
@@ -499,6 +504,26 @@ nextWinE = modA windowsA PL.next
 prevWinE :: EditorM ()
 prevWinE = modA windowsA PL.previous
 
+-- | Swaps the focused window with the first window. Useful for layouts such as 'HPairOneStack', for which the first window is the largest.
+swapWinWithFirstE :: EditorM ()
+swapWinWithFirstE = modA windowsA (swapFocus (fromJust . PL.move 0))
+
+-- | Moves the focused window to the first window, and moves all other windows down the stack.
+pushWinToFirstE :: EditorM ()
+pushWinToFirstE = modA windowsA pushToFirst
+  where
+      pushToFirst ws = case PL.delete ws of
+          Nothing -> ws
+          Just ws' -> PL.insertLeft (ws ^. PL.focusA) (fromJust $ PL.move 0 ws')
+
+-- | Swap focused window with the next one
+moveWinNextE :: EditorM ()
+moveWinNextE = modA windowsA (swapFocus PL.next)
+
+-- | Swap focused window with the previous one
+moveWinPrevE :: EditorM ()
+moveWinPrevE = modA windowsA (swapFocus PL.previous)
+
 -- | A "fake" accessor that fixes the current buffer after a change of the current
 -- window. 
 -- Enforces invariant that top of buffer stack is the buffer of the current window.
@@ -516,7 +541,7 @@ fixCurrentBufferA_ = fromSetGet (\new _old -> let
 fixCurrentWindow :: EditorM ()
 fixCurrentWindow = do
     b <- gets currentBuffer
-    modA (PL.focusA . PL.focusA . tabs_A) (\w -> w {bufkey = b})
+    modA (PL.focusA . windowsA) (\w -> w {bufkey = b})
 
 withWindowE :: Window -> BufferM a -> EditorM a
 withWindowE w = withGivenBufferAndWindow0 w (bufkey w)
@@ -529,7 +554,7 @@ findWindowWith k e =
 windowsOnBufferE :: BufferRef -> EditorM [Window]
 windowsOnBufferE k = do
   ts <- getA tabsA
-  return $ concatMap (concatMap (\win -> if (bufkey win == k) then [win] else [])) ts
+  return $ concatMap (concatMap (\win -> if (bufkey win == k) then [win] else []) . (^. tabWindowsA)) ts
 
 -- | bring the editor focus the window with the given key.
 --
@@ -544,7 +569,7 @@ focusWindowE k = do
         check r@(True, _) _win = r
 
         searchWindowSet (False, tabIndex, _) ws = 
-            case foldl check (False, 0) ws of
+            case foldl check (False, 0) (ws ^. tabWindowsA) of
                 (True, winIndex) -> (True, tabIndex, winIndex)
                 (False, _)       -> (False, tabIndex + 1, 0)
         searchWindowSet r@(True, _, _) _ws = r
@@ -563,6 +588,33 @@ splitE = do
   w <- newWindowE False b
   modA windowsA (PL.insertRight w)
 
+-- | Cycle to the next layout manager, or the first one if the current one is nonstandard.
+layoutManagersNextE :: EditorM ()
+layoutManagersNextE = withLMStack PL.next
+
+-- | Cycle to the previous layout manager, or the first one if the current one is nonstandard.
+layoutManagersPreviousE :: EditorM ()
+layoutManagersPreviousE = withLMStack PL.previous
+
+-- | Helper function for 'layoutManagersNext' and 'layoutManagersPrevious'
+withLMStack :: (PL.PointedList AnyLayoutManager -> PL.PointedList AnyLayoutManager) -> EditorM ()
+withLMStack f = askCfg >>= \cfg -> modA (tabLayoutManagerA . currentTabA) (go (layoutManagers cfg))
+  where
+     go [] lm = lm
+     go lms lm =
+       case findPL (layoutManagerSameType lm) lms of
+         Nothing -> head lms
+         Just lmsPL -> f lmsPL ^. PL.focusA
+
+-- | Next variant of the current layout manager, as given by 'nextVariant'
+layoutManagerNextVariantE :: EditorM ()
+layoutManagerNextVariantE = modA (tabLayoutManagerA . currentTabA) nextVariant
+
+-- | Previous variant of the current layout manager, as given by 'previousVariant'
+layoutManagerPreviousVariantE :: EditorM ()
+layoutManagerPreviousVariantE = modA (tabLayoutManagerA . currentTabA) previousVariant
+
+
 -- | Enlarge the current window
 enlargeWinE :: EditorM ()
 enlargeWinE = error "enlargeWinE: not implemented"
@@ -571,12 +623,17 @@ enlargeWinE = error "enlargeWinE: not implemented"
 shrinkWinE :: EditorM ()
 shrinkWinE = error "shrinkWinE: not implemented"
 
+-- | Sets the given divider position on the current tab
+setDividerPosE :: DividerRef -> DividerPosition -> EditorM ()
+setDividerPosE ref pos = putA (tabDividerPositionA ref . currentTabA) pos
+
 -- | Creates a new tab containing a window that views the current buffer.
 newTabE :: EditorM ()
 newTabE = do
     bk <- gets currentBuffer
     win <- newWindowE False bk
-    modA tabsA (PL.insertRight (PL.singleton win))
+    ref <- newRef
+    modA tabsA (PL.insertRight (makeTab1 ref win))
 
 -- | Moves to the next tab in the round robin set of tabs
 nextTabE :: EditorM ()
@@ -658,3 +715,15 @@ onCloseBufferE :: BufferRef -> EditorM () -> EditorM ()
 onCloseBufferE b a = do
     modA onCloseActionsA $ M.insertWith' (\_ old_a -> old_a >> a) b a
     
+-- put the template haskell at the end, to avoid 'variable not found' compile errors
+$(derive makeBinary ''TempBufferNameHint)
+
+-- For GHC 7.0 with template-haskell 2.5 (at least on my computer - coconnor) the Binary instance
+-- needs to be defined before the YiVariable instance. 
+--
+-- GHC 7.1 does not appear to have this issue.
+instance Initializable TempBufferNameHint where
+    initial = TempBufferNameHint "tmp" 0
+
+instance YiVariable TempBufferNameHint
+

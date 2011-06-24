@@ -1,4 +1,5 @@
-{-# LANGUAGE RelaxedPolyRec, FlexibleContexts, DeriveDataTypeable, TemplateHaskell, CPP, PatternGuards #-}
+{-# LANGUAGE RelaxedPolyRec, FlexibleContexts, DeriveDataTypeable, TemplateHaskell, CPP, PatternGuards, GeneralizedNewtypeDeriving, FlexibleInstances #-}
+{-# OPTIONS_GHC -fno-warn-unused-binds #-} -- TH-derived accessors
 
 -- Copyright (c) 2004-5 Don Stewart - http://www.cse.unsw.edu.au/~dons
 -- Copyright (c) 2008 Nicolas Pouillard
@@ -39,7 +40,9 @@ module Yi.Keymap.Vim (keymapSet,
                       ) where
 
 import Prelude (maybe, length, filter, map, drop, break, uncurry, reads)
+import Yi.Prelude
 
+import Data.Binary
 import Data.Char
 import Data.List (nub, take, words, dropWhile, takeWhile, intersperse, reverse)
 import Data.Maybe (fromMaybe, isJust)
@@ -132,8 +135,13 @@ data ViCmd = ArbCmd !(Int -> YiM ()) !Int
            | NoOp
   deriving (Typeable)
 
+instance Binary ViCmd where
+    put = dummyPut
+    get = dummyGet
+
 instance Initializable ViCmd where
   initial = NoOp
+instance YiVariable ViCmd
 
 data ViInsertion = ViIns { viActFirst  :: Maybe (EditorM ()) -- ^ The action performed first
                          , viActBefore :: BufferM () -- ^ The action performed before insertion
@@ -143,7 +151,16 @@ data ViInsertion = ViIns { viActFirst  :: Maybe (EditorM ()) -- ^ The action per
                          }
   deriving (Typeable)
 
+newtype MViInsertion = MVI { unMVI :: Maybe ViInsertion }
+  deriving(Typeable, Initializable)
+
+instance Binary MViInsertion where
+    put = dummyPut
+    get = dummyGet
+instance YiVariable MViInsertion
+
 $(nameDeriveAccessors ''ViInsertion $ Just.(++ "A"))
+$(nameDeriveAccessors ''MViInsertion $ Just.(++ "_A"))
 
 data VimOpts = VimOpts { tildeop :: Bool
                        , completeCaseSensitive :: Bool
@@ -158,10 +175,12 @@ data VimExCmd = VimExCmd { cmdNames :: [String]
 type VimExCmdMap = [VimExCmd] -- very simple implementation yet
 
 newtype VimTagStack = VimTagStack { tagsStack :: [(FilePath, Point)] }
-    deriving (Typeable)
+    deriving (Typeable, Binary)
 
 instance Initializable VimTagStack where
     initial = VimTagStack []
+
+instance YiVariable VimTagStack
 
 getTagStack :: EditorM VimTagStack
 getTagStack = getDynamic
@@ -214,7 +233,7 @@ lastViCommandA :: Accessor Editor ViCmd
 lastViCommandA = dynA
 
 currentViInsertionA :: Accessor FBuffer (Maybe ViInsertion)
-currentViInsertionA = bufferDynamicValueA
+currentViInsertionA = unMVI_A . bufferDynamicValueA
 
 applyViCmd :: Maybe Int -> ViCmd -> YiM ()
 applyViCmd _  NoOp = return ()
@@ -484,7 +503,7 @@ defKeymap = Proto template
      core_vis_mode selStyle = do
        write $ do withBuffer0' $ putA regionStyleA selStyle
                   setStatus ([msg selStyle], defaultStyle)
-       many (vis_move <|>
+       discard $ many (vis_move <|>
              select_any_unit (withBuffer0' . (\r -> resetSelectStyle >> extendSelectRegionB r >> leftB)))
        visual2other selStyle
        where msg LineWise  = "-- VISUAL LINE --"
@@ -536,7 +555,7 @@ defKeymap = Proto template
                   [c ?>> return (Exclusive, a x) | (c,a) <- moveCmdFM_exclusive ] ++
                   [events evs >> return (Exclusive, a x) | (evs,a) <- moveCmdS_exclusive ] ++
                   [c ?>> return (LineWise, a x) | (c,a) <- moveUpDownCmdFM] ++
-                  [do event c; c' <- textChar; return (r, a c' x) | (c,r,a) <- move2CmdFM] ++
+                  [do discard $ event c; c' <- textChar; return (r, a c' x) | (c,r,a) <- move2CmdFM] ++
                   [char 'G' ?>> return (LineWise, ArbMove $ setMarkHere '\'' >> maybe (botB >> firstNonSpaceB) gotoFNS cnt)
                   ,pString "gg" >> return (LineWise, ArbMove $ setMarkHere '\'' >> gotoFNS (fromMaybe 0 cnt))
                   ,char '\'' ?>> do c <- validMarkIdentifier
@@ -686,7 +705,7 @@ defKeymap = Proto template
              when (enableTagStack $ v_opts self)
                   viTagStackPushPos
              viFnewE filename
-             withBuffer' $ gotoLn line
+             discard $ withBuffer' $ gotoLn line
              return ()
 
      viTagStackPushPos :: YiM ()
@@ -695,8 +714,8 @@ defKeymap = Proto template
                                          pushTagStack bn p
 
      gotoPrevTagMark :: Int -> YiM ()
-     gotoPrevTagMark count = do
-       lastP <- withEditor $ popTagStack count
+     gotoPrevTagMark cnt = do
+       lastP <- withEditor $ popTagStack cnt
        case lastP of
          Nothing      -> withEditor $ fail "bottom of tag stack"
          Just (fp, p) -> do viFnewE fp
@@ -1144,10 +1163,12 @@ defKeymap = Proto template
        if c == '0' then deleteB Character Backward >> deleteIndentOfRegion r
                    else shiftIndentOfRegion (-1) r
 
+{-
+TODO: use or remove
      upTo :: Alternative f => f a -> Int -> f [a]
      _ `upTo` 0 = empty
      p `upTo` n = (:) <$> p <*> (p `upTo` pred n <|> pure []) 
-
+-}
      insertSpecialChar :: (Char -> BufferM ()) -> VimMode
      insertSpecialChar insrepB =
           insertNumber insrepB
@@ -1270,7 +1291,7 @@ defKeymap = Proto template
                           ,ctrlCh 'u'  ?>>! moveToSol >> deleteToEol]
                   <|| (insertChar >>! setHistoryPrefix)
            actionAndHistoryPrefix act = do
-             withBuffer0 $ act
+             discard $ withBuffer0 $ act
              setHistoryPrefix
            setHistoryPrefix = do
              ls <- withEditor . withBuffer0 $ elemsB
@@ -1328,7 +1349,7 @@ defKeymap = Proto template
 
        historyStart
        historyPrefixSet ""
-       spawnMinibufferE prompt $ const ex_process
+       discard $ spawnMinibufferE prompt $ const ex_process
        return ()
 
      -- | eval an ex command to an YiM (), also appends to the ex history
@@ -1542,7 +1563,7 @@ defKeymap = Proto template
            fn ('t':'a':'b':'m':' ':n) = withEditor (moveTab $ Just (read n))
            fn "tabnew"     = withEditor $ do
                newTabE
-               newTempBufferE
+               discard newTempBufferE
                return ()
            fn ('t':'a':'b':'e':' ':f) = withEditor newTabE >> viFnewE f
 
@@ -1639,7 +1660,7 @@ leave = oneOf [spec KEsc, ctrlCh 'c'] >> adjustPriority (-1) >> write clrStatus
 
 leaveInsRep :: VimMode
 leaveInsRep = do
-    oneOf [spec KEsc, ctrlCh '[', ctrlCh 'c']
+    discard $ oneOf [spec KEsc, ctrlCh '[', ctrlCh 'c']
     adjustPriority (-1)
     write $ commitLastInsertionE >> withBuffer0 (setMarkHere '^')
     startTopKeymap keymapSet
@@ -1649,7 +1670,7 @@ leaveInsRep = do
 ins_mode :: ModeMap -> VimMode
 ins_mode self = do
     startInsertKeymap keymapSet
-    many (v_ins_char self <|> kwd_mode (v_opts self))
+    discard $ many (v_ins_char self <|> kwd_mode (v_opts self))
     leaveInsRep
     write $ moveXorSol 1
 

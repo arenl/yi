@@ -1,4 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables, ExistentialQuantification, GeneralizedNewtypeDeriving, MultiParamTypeClasses #-}
+{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 -- Copyright (C) JP Bernardy 2009
 
 -- | This module defines implementations of syntax-awareness drivers.
@@ -12,18 +13,18 @@ import Data.List (takeWhile, unzip)
 import qualified  Data.Map as M
 import Data.Map (Map)
 
+import Yi.Buffer.Basic(WindowRef)
 import Yi.Lexer.Alex (Tok)
-import Yi.Region
 import Yi.Syntax hiding (Cache)
 import Yi.Syntax.Tree
 
 type Path = [Int]
 
 data Cache state tree tt = Cache {
-                                   path :: M.Map Int Path,
+                                   path :: M.Map WindowRef Path,
                                    cachedStates :: [state],
                                    root :: tree (Tok tt),
-                                   focused :: !(M.Map Int (tree (Tok tt)))
+                                   focused :: !(M.Map WindowRef (tree (Tok tt)))
                                  }
 
 mkHighlighter :: forall state tree tt. (IsTree tree, Show state) => 
@@ -51,7 +52,7 @@ mkHighlighter scanner =
                   recomputed = scanRun newScan resumeState
                   newResult :: tree (Tok tt)
                   newResult = if null recomputed then oldResult else snd $ head $ recomputed
-          focus r c@(Cache path states root _focused) = 
+          focus r (Cache path states root _focused) = 
               (Cache path' states root focused)
               where (path', focused) = unzipFM $ zipWithFM (\newpath oldpath -> fromNodeToFinal newpath (oldpath,root)) [] r path
 

@@ -1,13 +1,16 @@
+{-# LANGUAGE TemplateHaskell #-}
+
 module Yi.Config where
 
-import qualified Data.Map as M
 import Data.Prototype
+import Data.Accessor.Template
 
 import Yi.Buffer
+import Yi.Layout
 import Yi.Config.Misc
 import {-# source #-} Yi.Keymap
 import {-# source #-} Yi.Editor
-import Data.Dynamic
+import Yi.Dynamic(ConfigVariables)
 import Yi.Event
 import Yi.Style
 import Yi.Style.Library
@@ -48,8 +51,6 @@ data Config = Config {startFrontEnd :: UIBoot,
                       configInputPreprocess :: I.P Event Event,
                       modeTable :: [AnyMode],
                       -- ^ List modes by order of preference.
-                      publishedActions :: M.Map String [Data.Dynamic.Dynamic],
-                      -- ^ Actions available in the "interpreter" (akin to M-x in emacs)
                       debugMode :: Bool,
                       -- ^ Produce a .yi.dbg file with a lot of debug information.
                       configRegionStyle :: RegionStyle,
@@ -57,7 +58,11 @@ data Config = Config {startFrontEnd :: UIBoot,
                       configKillringAccumulate :: Bool,
                       -- ^ Set to 'True' for an emacs-like behaviour, where 
                       -- all deleted text is accumulated in a killring.
-                      bufferUpdateHandler :: [([Update] -> BufferM ())]
+                      bufferUpdateHandler :: [([Update] -> BufferM ())],
+                      layoutManagers :: [AnyLayoutManager],
+                      -- ^ List of layout managers for 'cycleLayoutManagersNext'
+                      configVars :: ConfigVariables
+                      -- ^ Custom configuration, containing the 'YiConfigVariable's. Configure with 'configVariableA'.
                      }
 
 configFundamentalMode :: Config -> AnyMode
@@ -67,3 +72,6 @@ configTopLevelKeymap :: Config -> Keymap
 configTopLevelKeymap = extractTopKeymap . defaultKm
 
 type UIBoot = Config -> (Event -> IO ()) -> ([Action] -> IO ()) ->  Editor -> IO UI
+
+$(nameDeriveAccessors ''Config (\n -> Just (n ++ "A")))
+$(nameDeriveAccessors ''UIConfig (\n -> Just (n ++ "A")))

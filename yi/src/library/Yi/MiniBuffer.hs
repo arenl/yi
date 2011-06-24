@@ -21,11 +21,9 @@ import Data.String (IsString)
 import Yi.Config
 import Yi.Core
 import Yi.History
-import Yi.Completion (commonPrefix, infixMatch, prefixMatch, containsMatch', completeInList, completeInList')
+import Yi.Completion (infixMatch, prefixMatch, containsMatch', completeInList, completeInList')
 import Yi.Style (defaultStyle)
-import Yi.Window ( wkey )
 import qualified Yi.Core as Editor
-import Control.Monad.Reader
 import qualified Data.Rope as R
 
 -- | Open a minibuffer window with the given prompt and keymap
@@ -130,7 +128,7 @@ withMinibufferGen proposal getHint prompt completer act = do
   showMatchingsOf ""
   withEditor $ do 
       historyStartGen prompt
-      spawnMinibufferE (prompt ++ " ") (\bindings -> rebindings <|| (bindings >> write showMatchings))
+      discard $ spawnMinibufferE (prompt ++ " ") (\bindings -> rebindings <|| (bindings >> write showMatchings))
       withBuffer0 $ replaceBufferContent proposal
 
 
@@ -195,6 +193,40 @@ instance Promptable Char where
 instance Promptable Int where
     getPromptedValue = return . read
     getPrompt _ = "Integer"
+
+-- helper functions:
+getPromptedValueList :: [(String,a)] -> String -> YiM a
+getPromptedValueList vs s = maybe (error "Invalid choice") return (lookup s vs)
+
+getMinibufferList :: [(String,a)] -> a -> String -> (String -> YiM ()) -> YiM ()
+getMinibufferList vs _ prompt act = withMinibufferFin prompt (fmap fst vs) act
+
+enumAll :: (Enum a, Bounded a, Show a) => [(String, a)]
+enumAll = (fmap (\v -> (show v, v)) [minBound..])
+
+instance Promptable Direction where
+    getPromptedValue = getPromptedValueList enumAll
+    getPrompt _ = "Direction"
+    getMinibuffer = getMinibufferList enumAll
+
+textUnits :: [(String, TextUnit)]
+textUnits =
+       [("Character", Character),
+        ("Document", Document),
+        ("Line", Line),
+        ("Paragraph", unitParagraph),
+        ("Word", unitWord),
+        ("ViWord", unitViWord)
+       ]
+
+instance Promptable TextUnit where
+    getPromptedValue = getPromptedValueList textUnits
+    getPrompt _ = "Unit"
+    getMinibuffer = getMinibufferList textUnits
+
+instance Promptable Point where
+    getPromptedValue s = Point <$> getPromptedValue s
+    getPrompt _ = "Point"
 
 anyModeName :: AnyMode -> String
 anyModeName (AnyMode m) = modeName m

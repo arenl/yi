@@ -1,13 +1,16 @@
 {-# LANGUAGE DeriveDataTypeable, FlexibleContexts, FlexibleInstances,
     FunctionalDependencies, GeneralizedNewtypeDeriving, MultiParamTypeClasses,
-    NoMonomorphismRestriction, TypeSynonymInstances #-}
+    NoMonomorphismRestriction, TypeSynonymInstances, TemplateHaskell #-}
+{-# OPTIONS_GHC -fno-warn-missing-signatures -fno-warn-incomplete-patterns -fno-warn-name-shadowing #-}
 module Yi.Snippets where
 
 import Prelude ()
 import Yi.Prelude
 
 import Control.Arrow
-import Control.Monad.RWS hiding (mapM, mapM_, forM, forM_, sequence)
+import Control.Monad.RWS hiding (mapM, mapM_, forM, forM_, sequence, get, put)
+import Data.Binary
+import Data.DeriveTH
 import Data.List hiding (foldl', find, elem, concat, concatMap)
 import Data.Char (isSpace)
 import Data.Maybe (fromJust, isJust)
@@ -29,18 +32,23 @@ data MarkInfo = SimpleMarkInfo { userIndex :: !Int, startMark :: !Mark }
               | ValuedMarkInfo { userIndex :: !Int, startMark :: !Mark, endMark :: !Mark } 
               | DependentMarkInfo { userIndex :: !Int, startMark :: !Mark, endMark :: !Mark }
   deriving (Eq, Show)
+
+$(derive makeBinary ''MarkInfo)
   
 newtype BufferMarks = BufferMarks { bufferMarks :: [MarkInfo] }
-  deriving (Eq, Show, Monoid, Typeable)
+  deriving (Eq, Show, Monoid, Typeable, Binary)
   
 newtype DependentMarks = DependentMarks { marks :: [[MarkInfo]] }
-  deriving (Eq, Show, Monoid, Typeable)
+  deriving (Eq, Show, Monoid, Typeable, Binary)
   
 instance Initializable BufferMarks where
   initial = BufferMarks []
   
 instance Initializable DependentMarks where
   initial = DependentMarks []
+
+instance YiVariable BufferMarks
+instance YiVariable DependentMarks
 
 instance Ord MarkInfo where
   a `compare` b = (userIndex a) `compare` (userIndex b)
@@ -134,7 +142,7 @@ runSnippet deleteLast s = do
         moveToNextBufferMark deleteLast
     return a
   where
-    len1 (x:[]) = True
+    len1 (_:[]) = True
     len1 _      = False
     
     belongTogether a b = userIndex a == userIndex b
@@ -206,7 +214,7 @@ withSimpleRegion (SimpleMarkInfo _ s) f = do
       then return $ mkRegion p p  -- return empty region
       else f =<< regionOfPartNonEmptyAtB unitViWordOnLine Forward p
         
-markRegion m@(SimpleMarkInfo _ s) = withSimpleRegion m $ \r -> do
+markRegion m@SimpleMarkInfo{} = withSimpleRegion m $ \r -> do
     os <- findOverlappingMarksWith safeMarkRegion concat True r m
     rOs <- mapM safeMarkRegion os
     return . mkRegion (regionStart r) $ foldl' minEnd (regionEnd r) rOs

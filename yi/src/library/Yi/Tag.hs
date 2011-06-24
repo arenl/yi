@@ -31,18 +31,17 @@ import System.FriendlyPath
 import Data.Map (Map, fromList, lookup, keys)
 import Data.List.Split (splitOn)
 
-import Data.Typeable
 import qualified Data.Trie as Trie
+import Data.Binary
+import Data.DeriveTH
 
 newtype Tags  = Tags (Maybe TagTable) deriving Typeable
 instance Initializable Tags where
     initial = Tags Nothing
 
-
 newtype TagsFileList  = TagsFileList [FilePath] deriving Typeable
 instance Initializable TagsFileList where
     initial = TagsFileList ["tags"]
-
 
 type Tag = String
 
@@ -123,3 +122,15 @@ getTagsFileList :: EditorM [FilePath]
 getTagsFileList = do 
   TagsFileList fps <- getDynamic
   return fps
+
+-- template haskell at the end to avoid 'not found' compilation errors
+$(derives [makeBinary] [''Tags, ''TagTable, ''TagsFileList])
+
+-- For GHC 7.0 with template-haskell 2.5 (at least on my computer - coconnor) the Binary instance
+-- needs to be defined before the YiVariable instance. 
+--
+-- GHC 7.1 does not appear to have this issue.
+instance YiVariable Tags
+
+instance YiVariable TagsFileList
+

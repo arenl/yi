@@ -77,9 +77,10 @@ data OvlLayer = UserLayer | HintLayer
   deriving (Ord, Eq)
 data Overlay = Overlay {
                         overlayLayer :: OvlLayer,
-                        overlayBegin :: MarkValue,
-                        overlayEnd :: MarkValue,
-                        overlayStyle :: StyleName
+                        -- underscores to avoid 'defined but not used'. Remove if desired
+                        _overlayBegin :: MarkValue,
+                        _overlayEnd :: MarkValue,
+                        _overlayStyle :: StyleName
                        }
 instance Eq Overlay where
     Overlay a b c _ == Overlay a' b' c' _ = a == a' && b == b' && c == c'
@@ -377,8 +378,8 @@ getMarkDefaultPosBI name defaultPos fb@FBufferData {marks = mks, markNames = nms
            in (fb {marks = mks', markNames = nms'}, newMark)
 
 
-getAst :: Int -> BufferImpl syntax -> syntax
+getAst :: WindowRef -> BufferImpl syntax -> syntax
 getAst w FBufferData {hlCache = HLState (SynHL {hlGetTree = gt}) cache} = gt cache w
 
-focusAst ::  M.Map Int Region -> BufferImpl syntax -> BufferImpl syntax
+focusAst ::  M.Map WindowRef Region -> BufferImpl syntax -> BufferImpl syntax
 focusAst r b@FBufferData {hlCache = HLState s@(SynHL {hlFocus = foc}) cache} = b {hlCache = HLState s (foc r cache)}

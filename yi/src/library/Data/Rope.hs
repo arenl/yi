@@ -38,7 +38,7 @@ import Prelude hiding (null, head, tail, length, take, drop, splitAt, head, tail
 import qualified Data.List as L
  
 import qualified Data.ByteString.UTF8 as B
-import qualified Data.ByteString as B (append, concat, elemIndices)
+import qualified Data.ByteString as B (append, concat)
 import qualified Data.ByteString as Byte 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LB (toChunks, fromChunks, null, readFile)
@@ -51,13 +51,8 @@ import Data.Binary
 import Data.Char (ord)
 import Data.Monoid
 import Data.Foldable (toList)
-import Data.Int
 
--- #ifdef CAUTIOUS_WRITES
--- import System.IO.Cautious (writeFileL)
--- #else
-import qualified Data.ByteString.Lazy as LB (writeFile)
--- #endif
+import System.IO.Cautious (writeFileL)
  
 defaultChunkSize :: Int
 defaultChunkSize = 128 -- in chars! (chunkSize requires this to be <= 256)
@@ -198,11 +193,7 @@ instance Binary Rope where
 
 
 writeFile :: FilePath -> Rope -> IO ()
--- #ifdef CAUTIOUS_WRITES
--- writeFile f r = writeFileL f $ toLazyByteString r
--- #else
-writeFile f r = LB.writeFile f $ toLazyByteString r
--- #endif
+writeFile f = writeFileL f . toLazyByteString
 
 readFile :: FilePath -> IO Rope
 readFile f = fromLazyByteString `fmap` LB.readFile f

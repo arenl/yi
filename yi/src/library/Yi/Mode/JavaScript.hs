@@ -7,17 +7,16 @@ module Yi.Mode.JavaScript (javaScriptMode, hooks) where
 import Control.Monad.Writer.Lazy (execWriter)
 import Data.List (nub)
 import Data.Maybe (isJust)
-import Data.Typeable (Typeable)
-import Prelude (unlines, map)
+import Prelude (map)
 import System.FilePath.Posix (takeBaseName)
 import Yi.Buffer.Basic (BufferRef, Direction(..), fromString)
 import Yi.Buffer.Indent (indentSettingsB, indentOfB, cycleIndentsB, newlineAndIndentB)
 import Yi.Buffer.HighLevel (replaceBufferContent, getNextNonBlankLineB, moveToSol)
 import Yi.Buffer.Misc (Mode(..), BufferM, IndentBehaviour, file, pointAt, shiftWidth)
-import Yi.Core ( (.), Mode, emptyMode, modeApplies, modeName
+import Yi.Core ( Mode, emptyMode, modeApplies, modeName
                , modeToggleCommentSelection, toggleCommentSelectionB, modeHL
-               , Char, modeGetStrokes, ($), withSyntax )
-import Yi.Dynamic (Initializable)
+               , modeGetStrokes, withSyntax )
+import Yi.Dynamic
 -- import Yi.Debug (traceM, traceM_)
 import Yi.Editor (withEditor, withOtherWindow, getDynamic, stringToNewBuffer
                  , findBuffer, switchToBufferE)
@@ -90,7 +89,9 @@ hooks mode = mode
   }
 
 newtype JSBuffer = JSBuffer (Maybe BufferRef)
-    deriving (Initializable, Typeable)
+    deriving (Initializable, Typeable, Binary)
+
+instance YiVariable JSBuffer
 
 -- | The "compiler."
 jsCompile :: Tree TT -> YiM ()

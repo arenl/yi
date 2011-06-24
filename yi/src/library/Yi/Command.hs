@@ -13,7 +13,6 @@ import Control.Monad.Trans (MonadIO (..))
 {- Local (yi) module imports -}
 
 import Prelude ()
-import Yi.Prelude (discard)
 import Yi.Core
 import Yi.MiniBuffer
 import qualified Yi.Mode.Compilation as Compilation
@@ -55,6 +54,7 @@ shellCommandV cmd = do
 newtype CabalBuffer = CabalBuffer {cabalBuffer :: Maybe BufferRef}
     deriving (Initializable, Typeable, Binary)
 
+instance YiVariable CabalBuffer
 
 ----------------------------
 -- | cabal-configure
